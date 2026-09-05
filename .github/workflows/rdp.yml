@@ -1,4 +1,4 @@
-name: Ubuntu VPS with XRDP, AIStudioToAPI & Rotating Relay
+name: Ubuntu VPS Relay Node
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
         type: string
 
 jobs:
-  vps-rdp:
+  vps-relay:
     name: Provision Ubuntu VPS Relay Node
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -33,7 +33,7 @@ jobs:
         run: |
           curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Connect to Tailscale (silver-trial)
+      - name: Connect to Tailscale Network (silver-trial)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
@@ -43,20 +43,20 @@ jobs:
             --hostname="silver-trial" \
             --accept-routes \
             --reset
-          echo "Tailscale connection established:"
+          echo "Tailscale active:"
           sudo tailscale status
 
-      - name: Clone THE-VPS-SET-UP Private Repository
+      - name: Clone Private VPS Setup Repository
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
         run: |
           git config --global user.name "Silver-kun"
           git config --global user.email "silver-kun@users.noreply.github.com"
-          git clone https://${GH_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git the-vps
-          echo "Cloned repository contents:"
+          git clone https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git the-vps
+          echo "Cloned private repo files:"
           ls -la the-vps/
 
-      - name: Configure XRDP & XFCE Desktop
+      - name: Configure XRDP & Desktop Environment
         env:
           RDP_PASS: ${{ github.event.inputs.rdp_password }}
         run: |
@@ -69,7 +69,7 @@ jobs:
           sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config 2>/dev/null || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
-          echo "XRDP listening on port 3389."
+          echo "XRDP listening on 3389."
 
       - name: Launch AIStudioToAPI Service
         run: |
@@ -77,44 +77,43 @@ jobs:
           echo "Starting AIStudioToAPI with Docker Compose..."
           docker compose up -d --build || docker compose up -d
 
-          echo "Waiting for AIStudioToAPI on port 7860..."
           for i in {1..30}; do
             if nc -z localhost 7860 2>/dev/null; then
-              echo "AIStudioToAPI is up and listening on port 7860!"
+              echo "AIStudioToAPI is up and listening on 7860!"
               break
             fi
             sleep 2
           done
 
-      - name: Configure Tailscale Port Forwarding (7860)
+      - name: Configure Tailscale Serve & Funnel (7860)
         if: ${{ github.event.inputs.enable_funnel == 'true' || github.event.inputs.enable_funnel == true }}
         run: |
-          echo "Exposing port 7860 via Tailscale Serve / Funnel..."
+          echo "Configuring Tailscale Serve & Funnel..."
           sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
           sudo tailscale funnel --bg --https=443 http://localhost:7860 || sudo tailscale funnel --bg 7860 || true
-          echo "Tailscale status & Funnel mappings:"
+          echo "Current status:"
           sudo tailscale serve status || true
           sudo tailscale funnel status || true
 
-      - name: Keep-Alive & Rotating Relay Handover Loop
+      - name: Workload Maintenance & Rotating Handover
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
           RDP_PASS: ${{ github.event.inputs.rdp_password }}
           ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           echo "==========================================================="
-          echo "  VPS & RDP Environment Initialized"
+          echo "  Node Active: ${GITHUB_REPOSITORY} (Cycle: ${CYCLE_COUNT})"
           echo "  Tailscale Hostname : silver-trial"
           echo "  Public Funnel URL  : https://silver-trial.tail042f54.ts.net"
           echo "  RDP Host / IP      : silver-trial:3389"
           echo "  RDP Username       : runner"
           echo "  AIStudio Local Port: 7860"
-          echo "  Current Repo       : ${GITHUB_REPOSITORY}"
-          echo "  Cycle Count        : ${CYCLE_COUNT}"
           echo "==========================================================="
 
           HANDOVER_MINUTE=345
+          TEARDOWN_MINUTE=347
           SHUTDOWN_MINUTE=350
           ELAPSED=0
 
@@ -122,13 +121,11 @@ jobs:
             sleep 60
             ELAPSED=$((ELAPSED + 1))
 
-            # Maintain XRDP service
             if ! nc -z localhost 3389 2>/dev/null; then
               echo "[$(date +'%T')] Restarting XRDP..."
               sudo systemctl restart xrdp
             fi
 
-            # Health log every 15 minutes
             if [ $((ELAPSED % 15)) -eq 0 ]; then
               STATUS=$(docker inspect -f '{{.State.Status}}' aistudio-to-api 2>/dev/null || echo "not running")
               echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${HANDOVER_MINUTE}m | AIStudioToAPI: ${STATUS}"
@@ -136,17 +133,20 @@ jobs:
           done
 
           echo "==========================================================="
-          echo "  HANDOVER WINDOW REACHED (Minute 345)"
-          echo "  Dispatching next runner in rotation..."
+          echo "  HANDOVER THRESHOLD REACHED (Minute 345)"
+          echo "  Calculating next ring successor..."
           echo "==========================================================="
 
           REPOS=(
-            "silverxcutonic/windows-rdp"
-            "silverxcutonic/windows-rdp-spare1"
-            "silverxcutonic/windows-rdp-spare2"
+            "octo-drift/vps-relay"
+            "pixel-forge6999/vps-relay"
+            "void-runner1/vps-relay"
+            "zenith-labs1/vps-relay"
+            "aurora-byte1/vps-relay"
+            "timber-code1/vps-relay"
           )
 
-          CURRENT_INDEX=0
+          CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
             if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
               CURRENT_INDEX=$i
@@ -154,22 +154,28 @@ jobs:
             fi
           done
 
+          if [ $CURRENT_INDEX -eq -1 ]; then
+            echo "Warning: Current repo not in ring list. Defaulting to index 0."
+            CURRENT_INDEX=0
+          fi
+
           NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
           FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
           PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
           FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
           NEXT_CYCLE=$((CYCLE_COUNT + 1))
 
-          dispatch() {
+          dispatch_runner() {
             local target="$1"
+            local token="$2"
             for attempt in 1 2 3 4; do
-              echo "Dispatch attempt $attempt to $target..."
-              if gh workflow run rdp.yml \
+              echo "Dispatch attempt $attempt to ${target}..."
+              if GH_TOKEN="$token" gh workflow run rdp.yml \
                 --repo "$target" \
                 -f rdp_password="$RDP_PASS" \
                 -f enable_funnel="$ENABLE_FUNNEL" \
                 -f cycle_count="$NEXT_CYCLE"; then
-                echo "Successfully triggered workflow on $target!"
+                echo "Successfully triggered workflow on ${target}."
                 return 0
               fi
               sleep 15
@@ -177,22 +183,28 @@ jobs:
             return 1
           }
 
-          if ! dispatch "$PRIMARY_TARGET"; then
-            echo "CRITICAL: Failed to dispatch to primary target $PRIMARY_TARGET. Attempting fallback $FALLBACK_TARGET..."
-            dispatch "$FALLBACK_TARGET" || echo "Relay dispatch failed completely."
+          if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+            echo "Primary dispatch to ${PRIMARY_TARGET} failed. Engaging fallback to ${FALLBACK_TARGET}..."
+            dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "Critical: All dispatches failed."
           fi
 
-          echo "Awaiting remaining 5 minutes for next runner to warm up..."
+          echo "Waiting until Minute ${TEARDOWN_MINUTE} before yielding Tailscale hostname..."
+          while [ $ELAPSED -lt $TEARDOWN_MINUTE ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 1))
+          done
+
+          echo "Yielding Tailscale hostname 'silver-trial' for successor node..."
+          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
+          sudo tailscale logout || true
+
+          echo "Node dereferenced. Waiting for clean shutdown at Minute ${SHUTDOWN_MINUTE}..."
           while [ $ELAPSED -lt $SHUTDOWN_MINUTE ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
           done
 
-      - name: Graceful Teardown & Ephemeral Tailscale Deregistration
+      - name: Final Teardown Safety Check
         if: always()
         run: |
-          echo "Performing graceful teardown..."
-          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
-          # Crucial: Deregister from Tailscale so next node becomes sole owner of silver-trial
-          sudo tailscale logout || true
-          echo "Node cleanly detached from Tailscale network."
+          sudo tailscale logout 2>/dev/null || true
