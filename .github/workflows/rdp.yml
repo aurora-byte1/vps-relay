@@ -1,49 +1,132 @@
-name: Windows RDP via Tailscale
+name: Ubuntu VPS with XRDP, AIStudioToAPI & Tailscale
 
 on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: 'Password for runneradmin RDP user'
+        description: 'Password for RDP user (runner)'
         required: true
         default: 'P@ssw0rd12345!'
         type: string
+      ts_hostname:
+        description: 'Tailscale Hostname'
+        required: true
+        default: 'silver-trial'
+        type: string
+      enable_funnel:
+        description: 'Expose port 7860 via Tailscale Funnel / Serve'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
-  rdp:
-    runs-on: windows-latest
+  vps-rdp:
+    name: Provision Ubuntu VPS (Tailscale + AIStudioToAPI + XRDP)
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          args: --hostname=gha-windows-rdp --accept-routes
+      - name: Checkout Current Repository
+        uses: actions/checkout@v4
 
-      - name: Configure RDP & User
-        shell: powershell
+      - name: Install Tailscale
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-          $Password = ConvertTo-SecureString "${{ github.event.inputs.rdp_password }}" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $Password
-
-          Write-Host "=========================================="
-          Write-Host "RDP Enabled successfully!"
-          Write-Host "Username: runneradmin"
-          Write-Host "Connect using Tailscale IP / hostname: gha-windows-rdp"
-          Write-Host "=========================================="
-
-      - name: Keep-Alive Loop
-        shell: powershell
+      - name: Connect to Tailscale (${{ github.event.inputs.ts_hostname }})
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          HOSTNAME: ${{ github.event.inputs.ts_hostname }}
         run: |
-          Write-Host "Session active. Will keep running for up to 6 hours or until cancelled."
-          $timeoutMinutes = 350
-          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-          while ($stopwatch.Elapsed.TotalMinutes -lt $timeoutMinutes) {
-            Start-Sleep -Seconds 60
-            Write-Host "Still running... Elapsed: $([int]$stopwatch.Elapsed.TotalMinutes) mins"
-          }
+          sudo systemctl start tailscaled
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${HOSTNAME}" \
+            --accept-routes \
+            --reset
+          echo "Tailscale connection established:"
+          sudo tailscale status
+
+      - name: Clone THE-VPS-SET-UP Private Repository
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config --global user.name "Silver-kun"
+          git config --global user.email "silver-kun@users.noreply.github.com"
+          git clone https://${GH_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git the-vps
+          echo "Cloned repository files:"
+          ls -la the-vps/
+
+      - name: Configure XRDP & XFCE Desktop
+        env:
+          RDP_PASS: ${{ github.event.inputs.rdp_password }}
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xrdp xfce4 xfce4-goodies
+          echo "xfce4-session" > ~/.xsession
+          echo "export GNOME_SHELL_SESSION_MODE=ubuntu" >> ~/.xsessionrc
+          echo "export XDG_CURRENT_DESKTOP=XFCE" >> ~/.xsessionrc
+          echo "runner:${RDP_PASS}" | sudo chpasswd
+          # Prevent authentication popup dialogs in XRDP session
+          sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config 2>/dev/null || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          echo "XRDP listening on port 3389."
+
+      - name: Launch AIStudioToAPI Service
+        run: |
+          cd the-vps/AIStudioToAPI
+          echo "Starting AIStudioToAPI with Docker Compose..."
+          docker compose up -d --build || docker compose up -d
+
+          echo "Waiting for AIStudioToAPI on port 7860..."
+          for i in {1..30}; do
+            if nc -z localhost 7860 2>/dev/null; then
+              echo "AIStudioToAPI is up and listening on port 7860!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Configure Tailscale Port Forwarding (7860)
+        if: ${{ github.event.inputs.enable_funnel == 'true' || github.event.inputs.enable_funnel == true }}
+        run: |
+          echo "Exposing port 7860 via Tailscale Serve / Funnel..."
+          # Serve port 7860 within the tailnet
+          sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
+          # Attempt Funnel if permitted on tailnet
+          sudo tailscale funnel --bg --https=443 http://localhost:7860 || sudo tailscale funnel --bg 7860 || true
+          echo "Current Tailscale status & port mappings:"
+          sudo tailscale serve status || true
+          sudo tailscale funnel status || true
+
+      - name: Keep-Alive & Health Monitoring Loop
+        env:
+          HOSTNAME: ${{ github.event.inputs.ts_hostname }}
+        run: |
+          echo "==========================================================="
+          echo "  VPS & RDP Environment Initialized"
+          echo "  Tailscale Hostname : ${HOSTNAME}"
+          echo "  RDP Host / IP      : ${HOSTNAME}:3389"
+          echo "  RDP Username       : runner"
+          echo "  AIStudio Local Port: 7860"
+          echo "==========================================================="
+
+          MAX_MINUTES=350
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_MINUTES ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 1))
+
+            # Revive XRDP if needed
+            if ! nc -z localhost 3389 2>/dev/null; then
+              echo "[$(date +'%T')] XRDP restarted."
+              sudo systemctl restart xrdp
+            fi
+
+            # Check AIStudioToAPI container
+            if [ $((ELAPSED % 5)) -eq 0 ]; then
+              STATUS=$(docker inspect -f '{{.State.Status}}' aistudio-to-api 2>/dev/null || echo "not running")
+              echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${MAX_MINUTES}m | AIStudioToAPI: ${STATUS}"
+            fi
+          done

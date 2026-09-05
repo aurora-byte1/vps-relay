@@ -1,16 +1,25 @@
-# Windows RDP via Tailscale
+# Ubuntu VPS with XRDP, AIStudioToAPI & Tailscale
 
-This repository provisions a GitHub Actions runner running Windows, connects it to your Tailscale mesh network, enables Remote Desktop (RDP), and keeps the session active.
+This repository provisions an Ubuntu GitHub Actions runner configured as a cloud VPS:
+- Connected to your Tailscale mesh network under hostname **`silver-trial`**
+- **AIStudioToAPI** running inside Docker Compose on port `7860`
+- Exposes port `7860` over Tailscale Serve / Funnel
+- Remote Desktop GUI via **XRDP + XFCE4**
 
-## Setup & Secrets
-- `TAILSCALE_AUTH_KEY`: Configured in GitHub Action Secrets.
+---
 
-## How to Connect
-1. Trigger the workflow manually from **Actions** -> **Windows RDP via Tailscale** -> **Run workflow**.
-2. Specify the RDP password (or use the default).
-3. Once the workflow starts and registers on Tailscale:
-   - Check your Tailscale admin console or devices list for `gha-windows-rdp`.
-   - Open Remote Desktop Connection (`mstsc.exe`).
-   - Computer: `gha-windows-rdp` (or its Tailscale 100.x.y.z IP).
-   - User: `runneradmin`
-   - Password: Password provided when triggering the workflow.
+## Connection Details
+
+- **Tailscale Hostname:** `silver-trial`
+- **RDP Address:** `silver-trial` (or its `100.x.y.z` Tailscale IP)
+- **RDP Port:** `3389`
+- **RDP Username:** `runner`
+- **RDP Password:** Provided during workflow trigger (Default: `P@ssw0rd12345!`)
+- **AIStudioToAPI:** `http://silver-trial:7860` or `https://silver-trial.<tailnet>.ts.net`
+
+---
+
+## Secrets Configured
+
+- `TAILSCALE_AUTH_KEY`: Ephemeral Tailscale auth key.
+- `GH_PAT`: Personal Access Token to clone `Silver-kun/THE-VPS-SET-UP`.
