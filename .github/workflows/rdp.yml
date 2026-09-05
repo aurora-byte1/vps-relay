@@ -33,16 +33,32 @@ jobs:
         run: |
           curl -fsSL https://tailscale.com/install.sh | sudo sh
 
+      - name: Restore Permanent Tailscale State & TLS Certs Cache
+        env:
+          STATE_B64: ${{ secrets.TAILSCALE_STATE_B64 }}
+        run: |
+          sudo mkdir -p /var/run/tailscale /var/lib/tailscale/certs
+          if [ -n "$STATE_B64" ]; then
+            echo "Restoring permanent Tailscale node identity and cached Let's Encrypt certificates..."
+            echo "$STATE_B64" | base64 -d | sudo tar -xz -C /var/lib/tailscale/
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state 2>/dev/null || true
+            sudo chmod 600 /var/lib/tailscale/certs/*.key 2>/dev/null || true
+            sudo chmod 644 /var/lib/tailscale/certs/*.crt 2>/dev/null || true
+            echo "Restored files:"
+            sudo ls -la /var/lib/tailscale/
+            sudo ls -la /var/lib/tailscale/certs/
+          fi
+
       - name: Connect to Tailscale Network (silver-trial)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           sudo systemctl start tailscaled
+          # Connect with permanent state; zero new ACME cert requests made!
           sudo tailscale up \
             --authkey="${TAILSCALE_AUTHKEY}" \
             --hostname="silver-trial" \
-            --accept-routes \
-            --reset
+            --accept-routes
           echo "Tailscale active:"
           sudo tailscale status
 
