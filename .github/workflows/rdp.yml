@@ -1,0 +1,49 @@
+name: Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'Password for runneradmin RDP user'
+        required: true
+        default: 'P@ssw0rd12345!'
+        type: string
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          args: --hostname=gha-windows-rdp --accept-routes
+
+      - name: Configure RDP & User
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+
+          $Password = ConvertTo-SecureString "${{ github.event.inputs.rdp_password }}" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $Password
+
+          Write-Host "=========================================="
+          Write-Host "RDP Enabled successfully!"
+          Write-Host "Username: runneradmin"
+          Write-Host "Connect using Tailscale IP / hostname: gha-windows-rdp"
+          Write-Host "=========================================="
+
+      - name: Keep-Alive Loop
+        shell: powershell
+        run: |
+          Write-Host "Session active. Will keep running for up to 6 hours or until cancelled."
+          $timeoutMinutes = 350
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          while ($stopwatch.Elapsed.TotalMinutes -lt $timeoutMinutes) {
+            Start-Sleep -Seconds 60
+            Write-Host "Still running... Elapsed: $([int]$stopwatch.Elapsed.TotalMinutes) mins"
+          }
