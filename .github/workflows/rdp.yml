@@ -1,4 +1,4 @@
-name: Ubuntu VPS with XRDP, AIStudioToAPI & Tailscale
+name: Ubuntu VPS with XRDP, AIStudioToAPI & Rotating Relay
 
 on:
   workflow_dispatch:
@@ -8,20 +8,20 @@ on:
         required: true
         default: 'P@ssw0rd12345!'
         type: string
-      ts_hostname:
-        description: 'Tailscale Hostname'
-        required: true
-        default: 'silver-trial'
-        type: string
       enable_funnel:
         description: 'Expose port 7860 via Tailscale Funnel / Serve'
         required: true
         default: true
         type: boolean
+      cycle_count:
+        description: 'Relay cycle counter'
+        required: false
+        default: '0'
+        type: string
 
 jobs:
   vps-rdp:
-    name: Provision Ubuntu VPS (Tailscale + AIStudioToAPI + XRDP)
+    name: Provision Ubuntu VPS Relay Node
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -33,15 +33,14 @@ jobs:
         run: |
           curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Connect to Tailscale (${{ github.event.inputs.ts_hostname }})
+      - name: Connect to Tailscale (silver-trial)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          HOSTNAME: ${{ github.event.inputs.ts_hostname }}
         run: |
           sudo systemctl start tailscaled
           sudo tailscale up \
             --authkey="${TAILSCALE_AUTHKEY}" \
-            --hostname="${HOSTNAME}" \
+            --hostname="silver-trial" \
             --accept-routes \
             --reset
           echo "Tailscale connection established:"
@@ -54,7 +53,7 @@ jobs:
           git config --global user.name "Silver-kun"
           git config --global user.email "silver-kun@users.noreply.github.com"
           git clone https://${GH_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git the-vps
-          echo "Cloned repository files:"
+          echo "Cloned repository contents:"
           ls -la the-vps/
 
       - name: Configure XRDP & XFCE Desktop
@@ -67,7 +66,6 @@ jobs:
           echo "export GNOME_SHELL_SESSION_MODE=ubuntu" >> ~/.xsessionrc
           echo "export XDG_CURRENT_DESKTOP=XFCE" >> ~/.xsessionrc
           echo "runner:${RDP_PASS}" | sudo chpasswd
-          # Prevent authentication popup dialogs in XRDP session
           sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config 2>/dev/null || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
@@ -92,41 +90,109 @@ jobs:
         if: ${{ github.event.inputs.enable_funnel == 'true' || github.event.inputs.enable_funnel == true }}
         run: |
           echo "Exposing port 7860 via Tailscale Serve / Funnel..."
-          # Serve port 7860 within the tailnet
           sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
-          # Attempt Funnel if permitted on tailnet
           sudo tailscale funnel --bg --https=443 http://localhost:7860 || sudo tailscale funnel --bg 7860 || true
-          echo "Current Tailscale status & port mappings:"
+          echo "Tailscale status & Funnel mappings:"
           sudo tailscale serve status || true
           sudo tailscale funnel status || true
 
-      - name: Keep-Alive & Health Monitoring Loop
+      - name: Keep-Alive & Rotating Relay Handover Loop
         env:
-          HOSTNAME: ${{ github.event.inputs.ts_hostname }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RDP_PASS: ${{ github.event.inputs.rdp_password }}
+          ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           echo "==========================================================="
           echo "  VPS & RDP Environment Initialized"
-          echo "  Tailscale Hostname : ${HOSTNAME}"
-          echo "  RDP Host / IP      : ${HOSTNAME}:3389"
+          echo "  Tailscale Hostname : silver-trial"
+          echo "  Public Funnel URL  : https://silver-trial.tail042f54.ts.net"
+          echo "  RDP Host / IP      : silver-trial:3389"
           echo "  RDP Username       : runner"
           echo "  AIStudio Local Port: 7860"
+          echo "  Current Repo       : ${GITHUB_REPOSITORY}"
+          echo "  Cycle Count        : ${CYCLE_COUNT}"
           echo "==========================================================="
 
-          MAX_MINUTES=350
+          HANDOVER_MINUTE=345
+          SHUTDOWN_MINUTE=350
           ELAPSED=0
-          while [ $ELAPSED -lt $MAX_MINUTES ]; do
+
+          while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
 
-            # Revive XRDP if needed
+            # Maintain XRDP service
             if ! nc -z localhost 3389 2>/dev/null; then
-              echo "[$(date +'%T')] XRDP restarted."
+              echo "[$(date +'%T')] Restarting XRDP..."
               sudo systemctl restart xrdp
             fi
 
-            # Check AIStudioToAPI container
-            if [ $((ELAPSED % 5)) -eq 0 ]; then
+            # Health log every 15 minutes
+            if [ $((ELAPSED % 15)) -eq 0 ]; then
               STATUS=$(docker inspect -f '{{.State.Status}}' aistudio-to-api 2>/dev/null || echo "not running")
-              echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${MAX_MINUTES}m | AIStudioToAPI: ${STATUS}"
+              echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${HANDOVER_MINUTE}m | AIStudioToAPI: ${STATUS}"
             fi
           done
+
+          echo "==========================================================="
+          echo "  HANDOVER WINDOW REACHED (Minute 345)"
+          echo "  Dispatching next runner in rotation..."
+          echo "==========================================================="
+
+          REPOS=(
+            "silverxcutonic/windows-rdp"
+            "silverxcutonic/windows-rdp-spare1"
+            "silverxcutonic/windows-rdp-spare2"
+          )
+
+          CURRENT_INDEX=0
+          for i in "${!REPOS[@]}"; do
+            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
+          PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
+          FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
+          NEXT_CYCLE=$((CYCLE_COUNT + 1))
+
+          dispatch() {
+            local target="$1"
+            for attempt in 1 2 3 4; do
+              echo "Dispatch attempt $attempt to $target..."
+              if gh workflow run rdp.yml \
+                --repo "$target" \
+                -f rdp_password="$RDP_PASS" \
+                -f enable_funnel="$ENABLE_FUNNEL" \
+                -f cycle_count="$NEXT_CYCLE"; then
+                echo "Successfully triggered workflow on $target!"
+                return 0
+              fi
+              sleep 15
+            done
+            return 1
+          }
+
+          if ! dispatch "$PRIMARY_TARGET"; then
+            echo "CRITICAL: Failed to dispatch to primary target $PRIMARY_TARGET. Attempting fallback $FALLBACK_TARGET..."
+            dispatch "$FALLBACK_TARGET" || echo "Relay dispatch failed completely."
+          fi
+
+          echo "Awaiting remaining 5 minutes for next runner to warm up..."
+          while [ $ELAPSED -lt $SHUTDOWN_MINUTE ]; do
+            sleep 60
+            ELAPSED=$((ELAPSED + 1))
+          done
+
+      - name: Graceful Teardown & Ephemeral Tailscale Deregistration
+        if: always()
+        run: |
+          echo "Performing graceful teardown..."
+          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
+          # Crucial: Deregister from Tailscale so next node becomes sole owner of silver-trial
+          sudo tailscale logout || true
+          echo "Node cleanly detached from Tailscale network."

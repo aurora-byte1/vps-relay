@@ -1,25 +1,46 @@
-# Ubuntu VPS with XRDP, AIStudioToAPI & Tailscale
+# Continuous Ubuntu VPS via 3-Repo Rotating Relay
 
-This repository provisions an Ubuntu GitHub Actions runner configured as a cloud VPS:
-- Connected to your Tailscale mesh network under hostname **`silver-trial`**
-- **AIStudioToAPI** running inside Docker Compose on port `7860`
-- Exposes port `7860` over Tailscale Serve / Funnel
-- Remote Desktop GUI via **XRDP + XFCE4**
+This setup provisions an Ubuntu GitHub Actions runner configured with XRDP, Dockerized AIStudioToAPI, and Tailscale mesh networking. It runs as a **self-sustaining rotating relay across 3 repositories** to achieve continuous uptime.
 
 ---
 
-## Connection Details
+## 🔁 The 3-Repository Relay Ring
 
+Every runner operates for up to **350 minutes**. At minute **345**, it automatically dispatches the next repository in the ring, allowing a 5-minute warm-up overlap for the new runner before cleanly deregistering from Tailscale.
+
+```
+┌────────────────────────────────┐
+│  silverxcutonic/windows-rdp    │
+└───────────────┬────────────────┘
+                │ (at 345m)
+                ▼
+┌────────────────────────────────┐
+│ silverxcutonic/windows-rdp-spare1
+└───────────────┬────────────────┘
+                │ (at 345m)
+                ▼
+┌────────────────────────────────┐
+│ silverxcutonic/windows-rdp-spare2
+└───────────────┬────────────────┘
+                │ (at 345m)
+                ▼
+(Loops back to windows-rdp)
+```
+
+---
+
+## 🌐 Endpoints & Connection (Static Across All Rotations)
+
+- **Public HTTPS Funnel URL:** `https://silver-trial.tail042f54.ts.net/`
 - **Tailscale Hostname:** `silver-trial`
-- **RDP Address:** `silver-trial` (or its `100.x.y.z` Tailscale IP)
-- **RDP Port:** `3389`
-- **RDP Username:** `runner`
-- **RDP Password:** Provided during workflow trigger (Default: `P@ssw0rd12345!`)
-- **AIStudioToAPI:** `http://silver-trial:7860` or `https://silver-trial.<tailnet>.ts.net`
+- **Private Tailnet Web UI:** `http://silver-trial:7860`
+- **RDP GUI:** `silver-trial:3389`
+- **RDP User:** `runner`
+- **RDP Password:** Provided at workflow dispatch (Default: `P@ssw0rd12345!`)
 
 ---
 
-## Secrets Configured
+## 🔐 Configured Secrets in All 3 Repositories
 
-- `TAILSCALE_AUTH_KEY`: Ephemeral Tailscale auth key.
-- `GH_PAT`: Personal Access Token to clone `Silver-kun/THE-VPS-SET-UP`.
+- `GH_PAT`: Personal Access Token with `repo` and `workflow` permissions to dispatch subsequent runs and clone private repositories.
+- `TAILSCALE_AUTH_KEY`: Ephemeral, reusable auth key for automatic Tailnet registration and node cleanup.
