@@ -54,11 +54,12 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           sudo systemctl start tailscaled
-          # Connect with permanent state; zero new ACME cert requests made!
+          # Connect with permanent state and --reset to claim hostname exclusively
           sudo tailscale up \
             --authkey="${TAILSCALE_AUTHKEY}" \
             --hostname="silver-trial" \
-            --accept-routes
+            --accept-routes \
+            --reset
           echo "Tailscale active:"
           sudo tailscale status
 
