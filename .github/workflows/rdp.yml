@@ -18,6 +18,11 @@ on:
         required: false
         default: '0'
         type: string
+      test_handover:
+        description: 'Test mode: hand over after X minutes (0 for normal 345m)'
+        required: false
+        default: '0'
+        type: string
 
 jobs:
   vps-relay:
@@ -47,6 +52,58 @@ jobs:
             echo "Restored files:"
             sudo ls -la /var/lib/tailscale/
             sudo ls -la /var/lib/tailscale/certs/
+          fi
+
+      - name: Handshake & Standby For Outgoing Node
+        env:
+          PREV_PAT: ${{ secrets.PREV_PAT }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          # Ring definition
+          REPOS=(
+            "octo-drift/vps-relay"
+            "pixel-forge6999/vps-relay"
+            "void-runner1/vps-relay"
+            "zenith-labs1/vps-relay"
+            "aurora-byte1/vps-relay"
+            "timber-code1/vps-relay"
+          )
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+
+          if [ $CURRENT_INDEX -ge 0 ]; then
+            PREV_INDEX=$(( (CURRENT_INDEX - 1 + ${#REPOS[@]}) % ${#REPOS[@]} ))
+            PREV_REPO="${REPOS[$PREV_INDEX]}"
+            echo "Checking predecessor node: ${PREV_REPO}..."
+
+            # Find active run on predecessor
+            PREV_RUN_ID=$(GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" --status in_progress --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || echo "")
+
+            if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
+              echo "Active predecessor run detected: #${PREV_RUN_ID} on ${PREV_REPO}"
+              echo "Gracefully terminating predecessor run to release 'silver-trial' cleanly..."
+              GH_TOKEN="$PREV_PAT" gh run cancel "$PREV_RUN_ID" --repo "$PREV_REPO" 2>/dev/null || true
+
+              # Wait up to 30s for predecessor to dereference
+              echo "Awaiting release of hostname 'silver-trial'..."
+              for sec in {1..15}; do
+                RUN_STATUS=$(GH_TOKEN="$PREV_PAT" gh run view "$PREV_RUN_ID" --repo "$PREV_REPO" --json status -q '.status' 2>/dev/null || echo "completed")
+                if [ "$RUN_STATUS" != "in_progress" ]; then
+                  echo "Predecessor terminated and deregistered in ${sec}s."
+                  break
+                fi
+                sleep 2
+              done
+              # Brief buffer to ensure Tailscale control plane fully registers logout
+              sleep 5
+            else
+              echo "No active predecessor run detected on ${PREV_REPO}. Safe to proceed."
+            fi
           fi
 
       - name: Connect to Tailscale Network (silver-trial)
@@ -119,6 +176,7 @@ jobs:
           RDP_PASS: ${{ github.event.inputs.rdp_password }}
           ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
         run: |
           echo "==========================================================="
           echo "  Node Active: ${GITHUB_REPOSITORY} (Cycle: ${CYCLE_COUNT})"
@@ -130,8 +188,11 @@ jobs:
           echo "==========================================================="
 
           HANDOVER_MINUTE=345
-          TEARDOWN_MINUTE=347
-          SHUTDOWN_MINUTE=350
+          if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
+            echo ">>> TEST HANDOVER OVERRIDE: ${TEST_HANDOVER} minute(s) <<<"
+            HANDOVER_MINUTE=$TEST_HANDOVER
+          fi
+
           ELAPSED=0
 
           while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
@@ -143,14 +204,14 @@ jobs:
               sudo systemctl restart xrdp
             fi
 
-            if [ $((ELAPSED % 15)) -eq 0 ]; then
+            if [ $((ELAPSED % 15)) -eq 0 ] || [ $HANDOVER_MINUTE -le 10 ]; then
               STATUS=$(docker inspect -f '{{.State.Status}}' aistudio-to-api 2>/dev/null || echo "not running")
               echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${HANDOVER_MINUTE}m | AIStudioToAPI: ${STATUS}"
             fi
           done
 
           echo "==========================================================="
-          echo "  HANDOVER THRESHOLD REACHED (Minute 345)"
+          echo "  HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE})"
           echo "  Calculating next ring successor..."
           echo "==========================================================="
 
@@ -191,7 +252,8 @@ jobs:
                 --repo "$target" \
                 -f rdp_password="$RDP_PASS" \
                 -f enable_funnel="$ENABLE_FUNNEL" \
-                -f cycle_count="$NEXT_CYCLE"; then
+                -f cycle_count="$NEXT_CYCLE" \
+                -f test_handover="0"; then
                 echo "Successfully triggered workflow on ${target}."
                 return 0
               fi
@@ -205,23 +267,19 @@ jobs:
             dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "Critical: All dispatches failed."
           fi
 
-          echo "Waiting until Minute ${TEARDOWN_MINUTE} before yielding Tailscale hostname..."
-          while [ $ELAPSED -lt $TEARDOWN_MINUTE ]; do
-            sleep 60
-            ELAPSED=$((ELAPSED + 1))
-          done
+          echo "Successor dispatched! Staying active for runner bootstrap (~3 minutes)..."
+          echo "Successor will cleanly signal cancellation once its environment is prepared."
 
-          echo "Yielding Tailscale hostname 'silver-trial' for successor node..."
-          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
-          sudo tailscale logout || true
-
-          echo "Node dereferenced. Waiting for clean shutdown at Minute ${SHUTDOWN_MINUTE}..."
-          while [ $ELAPSED -lt $SHUTDOWN_MINUTE ]; do
+          # Outgoing node continues serving requests until successor cancels or 10 min safety timeout
+          for wait_min in {1..10}; do
             sleep 60
-            ELAPSED=$((ELAPSED + 1))
+            echo "[$(date +'%T')] Outgoing node active & serving (handoff wait +${wait_min}m)..."
           done
 
       - name: Final Teardown Safety Check
         if: always()
         run: |
+          echo "Executing graceful logout and release of 'silver-trial'..."
+          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
           sudo tailscale logout 2>/dev/null || true
+          echo "Node clean shutdown complete."
