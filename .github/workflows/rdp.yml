@@ -9,7 +9,7 @@ on:
         default: 'P@ssw0rd12345!'
         type: string
       enable_funnel:
-        description: 'Expose port 7860 via Tailscale Funnel / Serve'
+        description: 'Expose service via Tailscale Funnel / Serve'
         required: true
         default: true
         type: boolean
@@ -18,8 +18,13 @@ on:
         required: false
         default: '0'
         type: string
+      retry_depth:
+        description: 'Pre-warming circuit breaker retry depth'
+        required: false
+        default: '0'
+        type: string
       test_handover:
-        description: 'Test mode: hand over after X minutes (0 for normal 345m)'
+        description: 'Test mode: hand over after X minutes (0 for normal 330m)'
         required: false
         default: '0'
         type: string
@@ -34,32 +39,80 @@ jobs:
       - name: Checkout Current Repository
         uses: actions/checkout@v4
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-      - name: Restore Permanent Tailscale State & TLS Certs Cache
+      # =====================================================================
+      # PHASE 1: PRE-WARMING (Predecessor remains active and serving traffic)
+      # =====================================================================
+      - name: Install System RDP & Docker Dependencies
+        id: prewarm
         env:
-          STATE_B64: ${{ secrets.TAILSCALE_STATE_B64 }}
+          RDP_PASS: ${{ github.event.inputs.rdp_password }}
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
         run: |
-          sudo mkdir -p /var/run/tailscale /var/lib/tailscale/certs
-          if [ -n "$STATE_B64" ]; then
-            echo "Restoring permanent Tailscale node identity and cached Let's Encrypt certificates..."
-            echo "$STATE_B64" | base64 -d | sudo tar -xz -C /var/lib/tailscale/
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state 2>/dev/null || true
-            sudo chmod 600 /var/lib/tailscale/certs/*.key 2>/dev/null || true
-            sudo chmod 644 /var/lib/tailscale/certs/*.crt 2>/dev/null || true
-            echo "Restored files:"
-            sudo ls -la /var/lib/tailscale/
-            sudo ls -la /var/lib/tailscale/certs/
+          echo "=== PHASE 1: Pre-Warming System & Local Workload ==="
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xrdp xfce4 xfce4-goodies curl jq netcat-openbsd
+
+          # XRDP Environment Setup
+          echo "xfce4-session" > ~/.xsession
+          echo "export GNOME_SHELL_SESSION_MODE=ubuntu" >> ~/.xsessionrc
+          echo "export XDG_CURRENT_DESKTOP=XFCE" >> ~/.xsessionrc
+          printf '%s:%s\n' "runner" "$RDP_PASS" | sudo chpasswd
+          sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config 2>/dev/null || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          # Clone Private Workload
+          git config --global user.name "Silver-kun"
+          git config --global user.email "silver-kun@users.noreply.github.com"
+          git clone --depth=1 "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" the-vps
+
+          # Launch AIStudioToAPI container safely
+          (cd the-vps/AIStudioToAPI && (docker compose up -d --build || docker compose up -d))
+
+          # Active Health Poll: localhost:7860/health (Timeout: 180s)
+          echo "Polling AIStudioToAPI health endpoint..."
+          WARM=false
+          for i in {1..36}; do
+            HEALTH_JSON=$(curl -s --connect-timeout 2 --max-time 3 http://localhost:7860/health 2>/dev/null || echo "")
+            if echo "$HEALTH_JSON" | grep -q '"browserConnected":\s*true' || echo "$HEALTH_JSON" | grep -q '"status":\s*"ok"'; then
+              echo "AIStudioToAPI verified 100% warm and operational in $((i * 5))s!"
+              WARM=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$WARM" != "true" ]; then
+            echo "ERROR: Local service failed to warm up within 180s."
+            exit 1
           fi
 
-      - name: Handshake & Standby For Outgoing Node
+      # =====================================================================
+      # CIRCUIT BREAKER: Dispatches next node if Phase 1 failed
+      # =====================================================================
+      - name: Circuit Breaker on Pre-Warming Failure
+        if: failure() && steps.prewarm.outcome == 'failure'
         env:
-          PREV_PAT: ${{ secrets.PREV_PAT }}
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
+          RDP_PASS: ${{ github.event.inputs.rdp_password }}
+          ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          RETRY_DEPTH: ${{ github.event.inputs.retry_depth }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
         run: |
-          # Ring definition
+          echo "=== CIRCUIT BREAKER TRIGGERED ==="
+          echo "Pre-warming failed. Predecessor is untouched and still serving."
+
+          DEPTH=${RETRY_DEPTH:-0}
+          if [ "$DEPTH" -ge 2 ]; then
+            echo "Max retry depth ($DEPTH) reached. Halting automatic failover to prevent ring loop."
+            exit 1
+          fi
+
+          NEW_DEPTH=$((DEPTH + 1))
+          echo "Executing fallback dispatch to next ring node with retry_depth=${NEW_DEPTH}..."
+
           REPOS=(
             "octo-drift/vps-relay"
             "pixel-forge6999/vps-relay"
@@ -70,7 +123,56 @@ jobs:
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
-            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
+          PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
+          FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
+
+          sleep 30
+          GH_TOKEN="$NEXT_PAT" gh workflow run rdp.yml \
+            --repo "$PRIMARY_TARGET" \
+            -f rdp_password="$RDP_PASS" \
+            -f enable_funnel="$ENABLE_FUNNEL" \
+            -f cycle_count="$CYCLE_COUNT" \
+            -f retry_depth="$NEW_DEPTH" \
+            -f test_handover="${TEST_HANDOVER:-0}" || \
+          GH_TOKEN="$FALLBACK_PAT" gh workflow run rdp.yml \
+            --repo "$FALLBACK_TARGET" \
+            -f rdp_password="$RDP_PASS" \
+            -f enable_funnel="$ENABLE_FUNNEL" \
+            -f cycle_count="$CYCLE_COUNT" \
+            -f retry_depth="$NEW_DEPTH" \
+            -f test_handover="${TEST_HANDOVER:-0}" || true
+
+          exit 1
+
+      # =====================================================================
+      # PHASE 2: HANDSHAKE & ACTIVE TAILNET EVICTION
+      # =====================================================================
+      - name: Handshake & Active Tailnet Eviction
+        env:
+          PREV_PAT: ${{ secrets.PREV_PAT }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          echo "=== PHASE 2: Handshake & Active Tailnet Eviction ==="
+          REPOS=(
+            "octo-drift/vps-relay"
+            "pixel-forge6999/vps-relay"
+            "void-runner1/vps-relay"
+            "zenith-labs1/vps-relay"
+            "aurora-byte1/vps-relay"
+            "timber-code1/vps-relay"
+          )
+          CURRENT_INDEX=-1
+          for i in "${!REPOS[@]}"; do
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
               CURRENT_INDEX=$i
               break
             fi
@@ -79,97 +181,90 @@ jobs:
           if [ $CURRENT_INDEX -ge 0 ]; then
             PREV_INDEX=$(( (CURRENT_INDEX - 1 + ${#REPOS[@]}) % ${#REPOS[@]} ))
             PREV_REPO="${REPOS[$PREV_INDEX]}"
-            echo "Checking predecessor node: ${PREV_REPO}..."
+            echo "Checking predecessor repo: ${PREV_REPO}..."
 
-            # Find active run on predecessor
-            PREV_RUN_ID=$(GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" --status in_progress --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || echo "")
+            PREV_RUN_ID=$(GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" \
+              --json databaseId,status -q '.[] | select(.status=="in_progress" or .status=="queued") | .databaseId' 2>/dev/null | head -n 1 || echo "")
 
             if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
-              echo "Active predecessor run detected: #${PREV_RUN_ID} on ${PREV_REPO}"
-              echo "Gracefully terminating predecessor run to release 'silver-trial' cleanly..."
+              echo "Cancelling predecessor run: #${PREV_RUN_ID} on ${PREV_REPO}..."
               GH_TOKEN="$PREV_PAT" gh run cancel "$PREV_RUN_ID" --repo "$PREV_REPO" 2>/dev/null || true
 
-              # Wait up to 30s for predecessor to dereference
-              echo "Awaiting release of hostname 'silver-trial'..."
+              # Await predecessor termination (up to 45s)
               for sec in {1..15}; do
-                RUN_STATUS=$(GH_TOKEN="$PREV_PAT" gh run view "$PREV_RUN_ID" --repo "$PREV_REPO" --json status -q '.status' 2>/dev/null || echo "completed")
-                if [ "$RUN_STATUS" != "in_progress" ]; then
-                  echo "Predecessor terminated and deregistered in ${sec}s."
+                RUN_STATUS=$(GH_TOKEN="$PREV_PAT" gh run view "$PREV_RUN_ID" --repo "$PREV_REPO" --json status -q '.status' 2>/dev/null || echo "")
+                if [ "$RUN_STATUS" = "completed" ] || [ "$RUN_STATUS" = "cancelled" ]; then
+                  echo "Predecessor cleanly terminated."
                   break
                 fi
-                sleep 2
+                sleep 3
               done
-              # Brief buffer to ensure Tailscale control plane fully registers logout
-              sleep 5
-            else
-              echo "No active predecessor run detected on ${PREV_REPO}. Safe to proceed."
             fi
           fi
 
-      - name: Connect to Tailscale Network (silver-trial)
+          # ACTIVE TAILNET EVICTION VIA BASIC AUTH API
+          if [ -n "$TAILSCALE_API_KEY" ]; then
+            echo "Executing Tailscale API device eviction for 'silver-trial'..."
+            DEVICE_IDS=$(curl -sSL -u "${TAILSCALE_API_KEY}:" \
+              "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null | \
+              jq -r '.devices[]? | select(.hostname | test("^silver-trial(-[0-9]+)?$")) | .id' || true)
+
+            for dev_id in $DEVICE_IDS; do
+              if [ -n "$dev_id" ] && [ "$dev_id" != "null" ]; then
+                echo "Evicting stale device ID: ${dev_id}..."
+                curl -sSL -X DELETE -u "${TAILSCALE_API_KEY}:" \
+                  "https://api.tailscale.com/api/v2/device/${dev_id}" 2>/dev/null || true
+              fi
+            done
+            sleep 3
+          else
+            echo "TAILSCALE_API_KEY not provided; skipping API-based eviction."
+          fi
+
+      # =====================================================================
+      # PHASE 3: ZERO-DOWNTIME TAILSCALE TAKEOVER
+      # =====================================================================
+      - name: Zero-Downtime Tailscale Takeover
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          STATE_B64: ${{ secrets.TAILSCALE_STATE_B64 }}
+          ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
         run: |
+          echo "=== PHASE 3: Tailscale Claim & Routing Configuration ==="
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+
+          sudo mkdir -p /var/run/tailscale /var/lib/tailscale/certs
+          if [ -n "$STATE_B64" ]; then
+            echo "Restoring permanent state & cached certificates..."
+            echo "$STATE_B64" | base64 -d | sudo tar -xz -C /var/lib/tailscale/ 2>/dev/null || true
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state 2>/dev/null || true
+            sudo chmod 600 /var/lib/tailscale/certs/*.key 2>/dev/null || true
+            sudo chmod 644 /var/lib/tailscale/certs/*.crt 2>/dev/null || true
+          fi
+
           sudo systemctl start tailscaled
-          # Connect with permanent state and --reset to claim hostname exclusively
           sudo tailscale up \
             --authkey="${TAILSCALE_AUTHKEY}" \
             --hostname="silver-trial" \
             --accept-routes \
             --reset
+
           echo "Tailscale active:"
           sudo tailscale status
 
-      - name: Clone Private VPS Setup Repository
-        env:
-          CLONE_PAT: ${{ secrets.CLONE_PAT }}
-        run: |
-          git config --global user.name "Silver-kun"
-          git config --global user.email "silver-kun@users.noreply.github.com"
-          git clone https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git the-vps
-          echo "Cloned private repo files:"
-          ls -la the-vps/
+          if [ "$ENABLE_FUNNEL" = "true" ] || [ "$ENABLE_FUNNEL" = true ]; then
+            echo "Configuring Tailscale Serve & Funnel without port collisions..."
+            sudo tailscale serve reset 2>/dev/null || true
+            # Bind public HTTPS 443 directly to local AIStudioToAPI port 7860
+            sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
+            echo "Current Funnel status:"
+            sudo tailscale funnel status || true
+          fi
 
-      - name: Configure XRDP & Desktop Environment
-        env:
-          RDP_PASS: ${{ github.event.inputs.rdp_password }}
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xrdp xfce4 xfce4-goodies
-          echo "xfce4-session" > ~/.xsession
-          echo "export GNOME_SHELL_SESSION_MODE=ubuntu" >> ~/.xsessionrc
-          echo "export XDG_CURRENT_DESKTOP=XFCE" >> ~/.xsessionrc
-          echo "runner:${RDP_PASS}" | sudo chpasswd
-          sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config 2>/dev/null || true
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-          echo "XRDP listening on 3389."
-
-      - name: Launch AIStudioToAPI Service
-        run: |
-          cd the-vps/AIStudioToAPI
-          echo "Starting AIStudioToAPI with Docker Compose..."
-          docker compose up -d --build || docker compose up -d
-
-          for i in {1..30}; do
-            if nc -z localhost 7860 2>/dev/null; then
-              echo "AIStudioToAPI is up and listening on 7860!"
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Configure Tailscale Serve & Funnel (7860)
-        if: ${{ github.event.inputs.enable_funnel == 'true' || github.event.inputs.enable_funnel == true }}
-        run: |
-          echo "Configuring Tailscale Serve & Funnel..."
-          sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
-          sudo tailscale funnel --bg --https=443 http://localhost:7860 || sudo tailscale funnel --bg 7860 || true
-          echo "Current status:"
-          sudo tailscale serve status || true
-          sudo tailscale funnel status || true
-
-      - name: Workload Maintenance & Rotating Handover
+      # =====================================================================
+      # PHASE 4: 330m PRODUCTION SHIFT & WATCHDOG
+      # =====================================================================
+      - name: Production Shift & Handover Dispatch
         env:
           NEXT_PAT: ${{ secrets.NEXT_PAT }}
           FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
@@ -178,43 +273,46 @@ jobs:
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
           TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
         run: |
-          echo "==========================================================="
-          echo "  Node Active: ${GITHUB_REPOSITORY} (Cycle: ${CYCLE_COUNT})"
-          echo "  Tailscale Hostname : silver-trial"
-          echo "  Public Funnel URL  : https://silver-trial.tail042f54.ts.net"
-          echo "  RDP Host / IP      : silver-trial:3389"
-          echo "  RDP Username       : runner"
-          echo "  AIStudio Local Port: 7860"
-          echo "==========================================================="
-
-          HANDOVER_MINUTE=345
+          echo "=== PHASE 4: Production Shift Active ==="
+          HANDOVER_MINUTE=330
           if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
             echo ">>> TEST HANDOVER OVERRIDE: ${TEST_HANDOVER} minute(s) <<<"
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
 
           ELAPSED=0
+          CONSECUTIVE_UNHEALTHY=0
 
           while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
 
+            # Watchdog: XRDP port 3389
             if ! nc -z localhost 3389 2>/dev/null; then
               echo "[$(date +'%T')] Restarting XRDP..."
               sudo systemctl restart xrdp
             fi
 
-            if [ $((ELAPSED % 15)) -eq 0 ] || [ $HANDOVER_MINUTE -le 10 ]; then
-              STATUS=$(docker inspect -f '{{.State.Status}}' aistudio-to-api 2>/dev/null || echo "not running")
-              echo "[$(date +'%T')] Elapsed: ${ELAPSED}/${HANDOVER_MINUTE}m | AIStudioToAPI: ${STATUS}"
+            # Watchdog: AIStudioToAPI health check
+            HEALTH=$(curl -s --connect-timeout 2 --max-time 3 http://localhost:7860/health 2>/dev/null || echo "")
+            if echo "$HEALTH" | grep -q '"browserConnected":\s*true' || echo "$HEALTH" | grep -q '"status":\s*"ok"'; then
+              CONSECUTIVE_UNHEALTHY=0
+            else
+              CONSECUTIVE_UNHEALTHY=$((CONSECUTIVE_UNHEALTHY + 1))
+              echo "[$(date +'%T')] Warning: Service check failed (${CONSECUTIVE_UNHEALTHY}/3)"
+              if [ $CONSECUTIVE_UNHEALTHY -ge 3 ]; then
+                echo "[$(date +'%T')] ALERT: 3 consecutive failures. Restarting AIStudioToAPI container..."
+                (cd the-vps/AIStudioToAPI && docker compose restart) || true
+                CONSECUTIVE_UNHEALTHY=0
+              fi
+            fi
+
+            if [ $((ELAPSED % 15)) -eq 0 ]; then
+              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Status: HEALTHY"
             fi
           done
 
-          echo "==========================================================="
-          echo "  HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE})"
-          echo "  Calculating next ring successor..."
-          echo "==========================================================="
-
+          echo "=== HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE}) ==="
           REPOS=(
             "octo-drift/vps-relay"
             "pixel-forge6999/vps-relay"
@@ -223,19 +321,14 @@ jobs:
             "aurora-byte1/vps-relay"
             "timber-code1/vps-relay"
           )
-
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
-            if [[ "${REPOS[$i]}" == "${GITHUB_REPOSITORY}" ]]; then
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
               CURRENT_INDEX=$i
               break
             fi
           done
-
-          if [ $CURRENT_INDEX -eq -1 ]; then
-            echo "Warning: Current repo not in ring list. Defaulting to index 0."
-            CURRENT_INDEX=0
-          fi
+          [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
 
           NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
           FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
@@ -253,7 +346,8 @@ jobs:
                 -f rdp_password="$RDP_PASS" \
                 -f enable_funnel="$ENABLE_FUNNEL" \
                 -f cycle_count="$NEXT_CYCLE" \
-                -f test_handover="0"; then
+                -f retry_depth="0" \
+                -f test_handover="${TEST_HANDOVER:-0}"; then
                 echo "Successfully triggered workflow on ${target}."
                 return 0
               fi
@@ -263,23 +357,23 @@ jobs:
           }
 
           if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
-            echo "Primary dispatch to ${PRIMARY_TARGET} failed. Engaging fallback to ${FALLBACK_TARGET}..."
-            dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "Critical: All dispatches failed."
+            echo "Primary dispatch failed. Activating fallback: ${FALLBACK_TARGET}..."
+            dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "CRITICAL: All dispatches failed!"
           fi
 
-          echo "Successor dispatched! Staying active for runner bootstrap (~3 minutes)..."
-          echo "Successor will cleanly signal cancellation once its environment is prepared."
-
-          # Outgoing node continues serving requests until successor cancels or 10 min safety timeout
-          for wait_min in {1..10}; do
+          echo "Successor dispatched! Entering active standby serving loop (up to 25m)..."
+          for wait_min in {1..25}; do
             sleep 60
-            echo "[$(date +'%T')] Outgoing node active & serving (handoff wait +${wait_min}m)..."
+            echo "[$(date +'%T')] Outgoing node active & serving traffic (standby +${wait_min}m)..."
           done
 
+      # =====================================================================
+      # PHASE 5: FINAL TEARDOWN SAFETY CHECK
+      # =====================================================================
       - name: Final Teardown Safety Check
         if: always()
         run: |
-          echo "Executing graceful logout and release of 'silver-trial'..."
-          cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down || true
+          echo "=== PHASE 5: Teardown & Deregistration ==="
+          (cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down -t 2) || true
           sudo tailscale logout 2>/dev/null || true
-          echo "Node clean shutdown complete."
+          echo "Node shutdown clean. 'silver-trial' released."
