@@ -231,7 +231,13 @@ jobs:
           ENABLE_FUNNEL: ${{ github.event.inputs.enable_funnel }}
         run: |
           echo "=== PHASE 3: Tailscale Claim & Routing Configuration ==="
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo mkdir -p --mode=0755 /usr/share/keyrings
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades tailscale=1.98.10 tailscale-archive-keyring || \
+            sudo apt-get install -y --allow-downgrades tailscale=1.96.4 tailscale-archive-keyring || \
+            (curl -fsSL https://tailscale.com/install.sh | sudo sh)
 
           sudo mkdir -p /var/run/tailscale /var/lib/tailscale/certs
           if [ -n "$STATE_B64" ]; then
@@ -253,11 +259,10 @@ jobs:
           sudo tailscale status
 
           if [ "$ENABLE_FUNNEL" = "true" ] || [ "$ENABLE_FUNNEL" = true ]; then
-            echo "Configuring Tailscale Serve & Funnel..."
+            echo "Configuring Tailscale Serve & Funnel on pinned 1.98.10..."
             sudo tailscale serve reset 2>/dev/null || true
-            sudo tailscale serve --bg --https=443 http://localhost:7860
-            sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
-            sudo tailscale funnel --bg 443 on || sudo tailscale funnel --bg --https=443 on || sudo tailscale funnel --bg 7860 on || true
+            sudo tailscale funnel --bg --https=443 http://localhost:7860
+            sudo tailscale cert silver-trial.tail042f54.ts.net 2>/dev/null || true
             echo "Current Funnel status:"
             sudo tailscale funnel status || true
           fi
