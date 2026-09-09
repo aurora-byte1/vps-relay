@@ -255,16 +255,52 @@ jobs:
             --accept-routes \
             --reset
 
+          # Ensure shields are down so Funnel ingress nodes can reach port 7860
+          sudo tailscale set --shields-up=false
+
           echo "Tailscale active:"
           sudo tailscale status
 
           if [ "$ENABLE_FUNNEL" = "true" ] || [ "$ENABLE_FUNNEL" = true ]; then
             echo "Configuring Tailscale Serve & Funnel on pinned 1.98.10..."
             sudo tailscale serve reset 2>/dev/null || true
-            sudo tailscale funnel --bg --https=443 http://localhost:7860
+
+            # 1. Establish internal proxy mapping
+            sudo tailscale serve --bg --https=443 http://localhost:7860
+            sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
+
+            # 2. Activate public Anycast Funnel
+            sudo tailscale funnel --bg --https=443 on || sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
+            sudo tailscale funnel --bg 7860 on || true
+
+            # 3. Generate certificate
             sudo tailscale cert silver-trial.tail042f54.ts.net 2>/dev/null || true
+
+            # 4. FIX FOR TAILSCALE ISSUE #19508: Restart daemon to force control plane sync
+            echo "Syncing Serve & Funnel configuration with Tailscale control plane..."
+            sudo systemctl restart tailscaled
+            sleep 4
+
             echo "Current Funnel status:"
             sudo tailscale funnel status || true
+
+            # 5. External Anycast Ingress Verification Loop
+            PUBLIC_EDGE_IP=$(dig +short silver-trial.tail042f54.ts.net @8.8.8.8 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || echo "")
+            if [ -n "$PUBLIC_EDGE_IP" ]; then
+              echo "Verifying external public edge ingress via Anycast IP ${PUBLIC_EDGE_IP}..."
+              for i in $(seq 1 10); do
+                HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 --resolve "silver-trial.tail042f54.ts.net:443:${PUBLIC_EDGE_IP}" "https://silver-trial.tail042f54.ts.net/health" 2>/dev/null || echo "000")
+                if [ "$HTTP_CODE" = "200" ]; then
+                  echo ">>> VERIFIED: External public Anycast Funnel is LIVE and serving HTTP 200! <<<"
+                  break
+                else
+                  echo "Edge sync in progress (status: ${HTTP_CODE}). Re-poking control plane (${i}/10)..."
+                  sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
+                  sudo systemctl restart tailscaled
+                  sleep 4
+                fi
+              done
+            fi
           fi
 
       # =====================================================================
