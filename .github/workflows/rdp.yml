@@ -272,6 +272,7 @@ jobs:
       # =====================================================================
       - name: Production Shift & Handover Dispatch
         env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
           NEXT_PAT: ${{ secrets.NEXT_PAT }}
           FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
           RDP_PASS: ${{ github.event.inputs.rdp_password }}
@@ -362,6 +363,28 @@ jobs:
             return 1
           }
 
+          sync_auth_tokens() {
+            if [ -d "the-vps" ] && [ -n "$CLONE_PAT" ]; then
+              echo "Checking for updated session tokens in auth folders..."
+              (
+                cd the-vps
+                git config user.name "Silver-kun"
+                git config user.email "silver-kun@users.noreply.github.com"
+                git add AIStudioToAPI/auth AIStudioToAPI/auth1 AIStudioToAPI/auth2 2>/dev/null || true
+                if ! git diff --cached --quiet; then
+                  echo "Found updated auth tokens! Committing and pushing to main..."
+                  git commit -m "Auto-refresh: update active session auth tokens [skip ci]" || true
+                  git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
+                else
+                  echo "No token changes detected in auth folders."
+                fi
+              ) || true
+            fi
+          }
+
+          # Sync refreshed tokens right before dispatching the successor
+          sync_auth_tokens
+
           if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
             echo "Primary dispatch failed. Activating fallback: ${FALLBACK_TARGET}..."
             dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "CRITICAL: All dispatches failed!"
@@ -378,8 +401,24 @@ jobs:
       # =====================================================================
       - name: Final Teardown Safety Check
         if: always()
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
         run: |
           echo "=== PHASE 5: Teardown & Deregistration ==="
+          # Final sync of auth folders if modified before container termination
+          if [ -d "the-vps" ] && [ -n "$CLONE_PAT" ]; then
+            echo "Final sync: preserving latest session tokens..."
+            (
+              cd the-vps
+              git config user.name "Silver-kun"
+              git config user.email "silver-kun@users.noreply.github.com"
+              git add AIStudioToAPI/auth AIStudioToAPI/auth1 AIStudioToAPI/auth2 2>/dev/null || true
+              if ! git diff --cached --quiet; then
+                git commit -m "Auto-refresh: final session token sync [skip ci]" || true
+                git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
+              fi
+            ) || true
+          fi
           (cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down -t 2) || true
           sudo tailscale logout 2>/dev/null || true
           echo "Node shutdown clean. 'silver-trial' released."
