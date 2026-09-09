@@ -253,10 +253,11 @@ jobs:
           sudo tailscale status
 
           if [ "$ENABLE_FUNNEL" = "true" ] || [ "$ENABLE_FUNNEL" = true ]; then
-            echo "Configuring Tailscale Serve & Funnel without port collisions..."
+            echo "Configuring Tailscale Serve & Funnel..."
             sudo tailscale serve reset 2>/dev/null || true
-            # Bind public HTTPS 443 directly to local AIStudioToAPI port 7860
-            sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
+            sudo tailscale serve --bg --https=443 http://localhost:7860
+            sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
+            sudo tailscale funnel --bg 443 on || sudo tailscale funnel --bg --https=443 on || sudo tailscale funnel --bg 7860 on || true
             echo "Current Funnel status:"
             sudo tailscale funnel status || true
           fi
