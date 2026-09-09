@@ -370,7 +370,7 @@ jobs:
                 cd the-vps
                 git config user.name "Silver-kun"
                 git config user.email "silver-kun@users.noreply.github.com"
-                git add AIStudioToAPI/auth AIStudioToAPI/auth1 AIStudioToAPI/auth2 2>/dev/null || true
+                git add AIStudioToAPI/auth* 2>/dev/null || true
                 if ! git diff --cached --quiet; then
                   echo "Found updated auth tokens! Committing and pushing to main..."
                   git commit -m "Auto-refresh: update active session auth tokens [skip ci]" || true
@@ -412,7 +412,7 @@ jobs:
               cd the-vps
               git config user.name "Silver-kun"
               git config user.email "silver-kun@users.noreply.github.com"
-              git add AIStudioToAPI/auth AIStudioToAPI/auth1 AIStudioToAPI/auth2 2>/dev/null || true
+              git add AIStudioToAPI/auth* 2>/dev/null || true
               if ! git diff --cached --quiet; then
                 git commit -m "Auto-refresh: final session token sync [skip ci]" || true
                 git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
