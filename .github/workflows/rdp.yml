@@ -50,7 +50,7 @@ jobs:
         run: |
           echo "=== PHASE 1: Pre-Warming System & Local Workload ==="
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xrdp xfce4 xfce4-goodies curl jq netcat-openbsd
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xrdp xfce4 xfce4-goodies curl jq netcat-openbsd dnsutils
 
           # XRDP Environment Setup
           echo "xfce4-session" > ~/.xsession
@@ -64,6 +64,7 @@ jobs:
           # Clone Private Workload
           git config --global user.name "Silver-kun"
           git config --global user.email "silver-kun@users.noreply.github.com"
+          rm -rf the-vps 2>/dev/null || true
           git clone --depth=1 "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" the-vps
 
           # Launch AIStudioToAPI container safely
@@ -190,8 +191,8 @@ jobs:
               echo "Cancelling predecessor run: #${PREV_RUN_ID} on ${PREV_REPO}..."
               GH_TOKEN="$PREV_PAT" gh run cancel "$PREV_RUN_ID" --repo "$PREV_REPO" 2>/dev/null || true
 
-              # Await predecessor termination (up to 45s)
-              for sec in {1..15}; do
+              # Await predecessor termination (up to 90s to allow auth token sync to finish)
+              for sec in {1..30}; do
                 RUN_STATUS=$(GH_TOKEN="$PREV_PAT" gh run view "$PREV_RUN_ID" --repo "$PREV_REPO" --json status -q '.status' 2>/dev/null || echo "")
                 if [ "$RUN_STATUS" = "completed" ] || [ "$RUN_STATUS" = "cancelled" ]; then
                   echo "Predecessor cleanly terminated."
@@ -264,42 +265,60 @@ jobs:
           if [ "$ENABLE_FUNNEL" = "true" ] || [ "$ENABLE_FUNNEL" = true ]; then
             echo "Configuring Tailscale Serve & Funnel on pinned 1.98.10..."
             sudo tailscale serve reset 2>/dev/null || true
+            sudo tailscale funnel reset 2>/dev/null || true
 
-            # 1. Establish internal proxy mapping
-            sudo tailscale serve --bg --https=443 http://localhost:7860
+            # 1. Atomic Funnel configuration on standard HTTPS port 443
+            sudo tailscale funnel --bg --https=443 http://localhost:7860
+
+            # 2. Internal Tailnet-only mapping for port 7860 (Funnel strictly permits 443, 8443, 10000)
             sudo tailscale serve --bg --https=7860 http://localhost:7860 || true
 
-            # 2. Activate public Anycast Funnel
-            sudo tailscale funnel --bg --https=443 on || sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
-            sudo tailscale funnel --bg 7860 on || true
-
-            # 3. Generate certificate
-            sudo tailscale cert silver-trial.tail042f54.ts.net 2>/dev/null || true
-
-            # 4. FIX FOR TAILSCALE ISSUE #19508: Restart daemon to force control plane sync
+            # 3. Apply single control-plane sync restart (Workaround for Tailscale Issue #19508)
             echo "Syncing Serve & Funnel configuration with Tailscale control plane..."
             sudo systemctl restart tailscaled
-            sleep 4
+
+            # 4. Settle check: Wait for Tailscale daemon to report active Running state
+            echo "Awaiting daemon stabilization..."
+            for _ in $(seq 1 15); do
+              if sudo tailscale status --json 2>/dev/null | grep -q '"BackendState":\s*"Running"'; then
+                break
+              fi
+              sleep 1
+            done
 
             echo "Current Funnel status:"
             sudo tailscale funnel status || true
 
-            # 5. External Anycast Ingress Verification Loop
-            PUBLIC_EDGE_IP=$(dig +short silver-trial.tail042f54.ts.net @8.8.8.8 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || echo "")
+            # 5. Robust multi-tier DNS resolution for Tailscale Anycast Edge IP
+            PUBLIC_EDGE_IP=$(dig +short silver-trial.tail042f54.ts.net 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || \
+                             dig +short silver-trial.tail042f54.ts.net @8.8.8.8 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || \
+                             python3 -c "import socket; print(socket.gethostbyname('silver-trial.tail042f54.ts.net'))" 2>/dev/null | tr -d '[:space:]' || echo "")
+
             if [ -n "$PUBLIC_EDGE_IP" ]; then
               echo "Verifying external public edge ingress via Anycast IP ${PUBLIC_EDGE_IP}..."
-              for i in $(seq 1 10); do
-                HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 --resolve "silver-trial.tail042f54.ts.net:443:${PUBLIC_EDGE_IP}" "https://silver-trial.tail042f54.ts.net/health" 2>/dev/null || echo "000")
+              VERIFIED=false
+              # Non-destructive polling loop: gives Anycast edge up to 60s to converge without restarting tailscaled
+              for i in $(seq 1 12); do
+                HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" \
+                  --connect-timeout 3 --max-time 5 \
+                  --resolve "silver-trial.tail042f54.ts.net:443:${PUBLIC_EDGE_IP}" \
+                  "https://silver-trial.tail042f54.ts.net/health" 2>/dev/null || echo "000")
+
                 if [ "$HTTP_CODE" = "200" ]; then
-                  echo ">>> VERIFIED: External public Anycast Funnel is LIVE and serving HTTP 200! <<<"
+                  echo ">>> VERIFIED: External public Anycast Funnel is LIVE and serving HTTP 200! (Attempt ${i}/12) <<<"
+                  VERIFIED=true
                   break
                 else
-                  echo "Edge sync in progress (status: ${HTTP_CODE}). Re-poking control plane (${i}/10)..."
-                  sudo tailscale funnel --bg --https=443 http://localhost:7860 || true
-                  sudo systemctl restart tailscaled
-                  sleep 4
+                  echo "Edge propagation in progress (HTTP ${HTTP_CODE}). Awaiting edge convergence (${i}/12)..."
+                  sleep 5
                 fi
               done
+
+              if [ "$VERIFIED" != "true" ]; then
+                echo "::warning::Edge verification timed out after 60s. Node will continue serving as edge caches converge."
+              fi
+            else
+              echo "::warning::Unable to resolve edge IP via DNS or Python resolver. Skipping direct IP verification."
             fi
           fi
 
@@ -410,6 +429,8 @@ jobs:
                 if ! git diff --cached --quiet; then
                   echo "Found updated auth tokens! Committing and pushing to main..."
                   git commit -m "Auto-refresh: update active session auth tokens [skip ci]" || true
+                  # Pull newest remote changes to prevent non-fast-forward rejection
+                  git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
                   git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
                 else
                   echo "No token changes detected in auth folders."
@@ -451,10 +472,11 @@ jobs:
               git add AIStudioToAPI/auth* 2>/dev/null || true
               if ! git diff --cached --quiet; then
                 git commit -m "Auto-refresh: final session token sync [skip ci]" || true
+                git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
                 git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
               fi
             ) || true
           fi
           (cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down -t 2) || true
-          sudo tailscale logout 2>/dev/null || true
+          sudo tailscale down 2>/dev/null || true
           echo "Node shutdown clean. 'silver-trial' released."
