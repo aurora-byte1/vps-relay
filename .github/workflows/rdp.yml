@@ -203,23 +203,24 @@ jobs:
             fi
           fi
 
-          # ACTIVE TAILNET EVICTION VIA BASIC AUTH API
+          # ACTIVE TAILNET EVICTION: Clean up accidental numeric drift nodes (silver-trial-[0-9]+)
+          # CRITICAL: NEVER evict the golden root device 'silver-trial'!
           if [ -n "$TAILSCALE_API_KEY" ]; then
-            echo "Executing Tailscale API device eviction for 'silver-trial'..."
-            DEVICE_IDS=$(curl -sSL -u "${TAILSCALE_API_KEY}:" \
+            echo "Checking for orphaned drift devices (silver-trial-[0-9]+)..."
+            DRIFT_DEVICE_IDS=$(curl -sSL -u "${TAILSCALE_API_KEY}:" \
               "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null | \
-              jq -r '.devices[]? | select(.hostname | test("^silver-trial(-[0-9]+)?$")) | .id' || true)
+              jq -r '.devices[]? | select(.hostname | test("^silver-trial-[0-9]+$")) | .id' || true)
 
-            for dev_id in $DEVICE_IDS; do
+            for dev_id in $DRIFT_DEVICE_IDS; do
               if [ -n "$dev_id" ] && [ "$dev_id" != "null" ]; then
-                echo "Evicting stale device ID: ${dev_id}..."
+                echo "Evicting stale drift device ID: ${dev_id}..."
                 curl -sSL -X DELETE -u "${TAILSCALE_API_KEY}:" \
                   "https://api.tailscale.com/api/v2/device/${dev_id}" 2>/dev/null || true
               fi
             done
-            sleep 3
+            sleep 2
           else
-            echo "TAILSCALE_API_KEY not provided; skipping API-based eviction."
+            echo "TAILSCALE_API_KEY not provided; skipping drift device pruning."
           fi
 
       # =====================================================================
@@ -234,22 +235,57 @@ jobs:
           echo "=== PHASE 3: Tailscale Claim & Routing Configuration ==="
           sudo mkdir -p --mode=0755 /usr/share/keyrings
           curl -fsSL https://tailscale.com/install.sh | sudo sh
+          sudo systemctl stop tailscaled 2>/dev/null || true
 
           sudo mkdir -p /var/run/tailscale /var/lib/tailscale/certs
-          if [ -n "$STATE_B64" ]; then
-            echo "Restoring permanent state & cached certificates..."
-            echo "$STATE_B64" | base64 -d | sudo tar -xz -C /var/lib/tailscale/ 2>/dev/null || true
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state 2>/dev/null || true
-            sudo chmod 600 /var/lib/tailscale/certs/*.key 2>/dev/null || true
-            sudo chmod 644 /var/lib/tailscale/certs/*.crt 2>/dev/null || true
+
+          RESTORED=false
+          # 1. Restore golden state from cloned Silver-kun/THE-VPS-SET-UP
+          if [ -f "the-vps/configs/tailscale/tailscaled_trial.state" ]; then
+            echo "Restoring golden state from the-vps/configs/tailscale/tailscaled_trial.state..."
+            sudo cp -f "the-vps/configs/tailscale/tailscaled_trial.state" /var/lib/tailscale/tailscaled.state
+            RESTORED=true
+          elif [ -f "the-vps/configs/tailscale/tailscaled.state" ]; then
+            echo "Restoring golden state from the-vps/configs/tailscale/tailscaled.state..."
+            sudo cp -f "the-vps/configs/tailscale/tailscaled.state" /var/lib/tailscale/tailscaled.state
+            RESTORED=true
           fi
 
+          # 2. Restore cached Let's Encrypt certificates
+          if [ -d "the-vps/configs/tailscale/certs" ]; then
+            echo "Restoring Let's Encrypt certificates from the-vps/configs/tailscale/certs/..."
+            sudo cp -rf the-vps/configs/tailscale/certs/* /var/lib/tailscale/certs/ 2>/dev/null || true
+          fi
+          if [ -f "the-vps/configs/tailscale/cert.crt" ] && [ -f "the-vps/configs/tailscale/cert.key" ]; then
+            sudo cp -f the-vps/configs/tailscale/cert.crt /var/lib/tailscale/certs/cert.crt
+            sudo cp -f the-vps/configs/tailscale/cert.key /var/lib/tailscale/certs/cert.key
+          fi
+
+          # 3. Fallback to base64 secret if repo files were not present
+          if [ "$RESTORED" != "true" ] && [ -n "$STATE_B64" ]; then
+            echo "Restoring permanent state & cached certificates from STATE_B64 secret..."
+            echo "$STATE_B64" | base64 -d | sudo tar -xz -C /var/lib/tailscale/ 2>/dev/null || true
+            RESTORED=true
+          fi
+
+          sudo chmod 600 /var/lib/tailscale/tailscaled.state 2>/dev/null || true
+          sudo chmod -R 600 /var/lib/tailscale/certs/*.key* 2>/dev/null || true
+          sudo chmod -R 644 /var/lib/tailscale/certs/*.crt* 2>/dev/null || true
+
+          # Start daemon with injected golden identity
           sudo systemctl start tailscaled
           sudo tailscale up \
             --authkey="${TAILSCALE_AUTHKEY}" \
             --hostname="silver-trial" \
-            --accept-routes \
-            --reset
+            --accept-routes
+
+          # Enforce strict assertion against hostname drift
+          REGISTERED_NAME=$(sudo tailscale status --json | jq -r '.Self.HostName // empty')
+          echo "Tailscale registered hostname: '${REGISTERED_NAME}'"
+          if [ "$REGISTERED_NAME" != "silver-trial" ]; then
+            echo "::error::CRITICAL: Hostname drift detected ('${REGISTERED_NAME}' != 'silver-trial')! Aborting to prevent routing corruption."
+            exit 1
+          fi
 
           # Ensure shields are down so Funnel ingress nodes can reach port 7860
           sudo tailscale set --shields-up=false
@@ -413,29 +449,37 @@ jobs:
             return 1
           }
 
-          sync_auth_tokens() {
+          sync_auth_and_state() {
             if [ -d "the-vps" ] && [ -n "$CLONE_PAT" ]; then
-              echo "Checking for updated session tokens in auth folders..."
+              echo "Checking for updated session tokens and persistent Tailscale state..."
               (
                 cd the-vps
                 git config user.name "Silver-kun"
                 git config user.email "silver-kun@users.noreply.github.com"
-                git add AIStudioToAPI/auth* 2>/dev/null || true
+
+                # Capture updated tailscale state and certs
+                mkdir -p configs/tailscale/certs
+                sudo cp -f /var/lib/tailscale/tailscaled.state configs/tailscale/tailscaled.state 2>/dev/null || true
+                sudo cp -f /var/lib/tailscale/tailscaled.state configs/tailscale/tailscaled_trial.state 2>/dev/null || true
+                sudo cp -rf /var/lib/tailscale/certs/* configs/tailscale/certs/ 2>/dev/null || true
+                sudo chown -R runner:docker configs/tailscale/
+
+                git add AIStudioToAPI/auth* configs/tailscale/ 2>/dev/null || true
                 if ! git diff --cached --quiet; then
-                  echo "Found updated auth tokens! Committing and pushing to main..."
-                  git commit -m "Auto-refresh: update active session auth tokens [skip ci]" || true
+                  echo "Found updated auth tokens or Tailscale state! Committing and pushing to main..."
+                  git commit -m "Auto-refresh: update active session tokens & persistent Tailscale state [skip ci]" || true
                   # Pull newest remote changes to prevent non-fast-forward rejection
                   git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
                   git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
                 else
-                  echo "No token changes detected in auth folders."
+                  echo "No changes detected in auth folders or Tailscale state."
                 fi
               ) || true
             fi
           }
 
-          # Sync refreshed tokens right before dispatching the successor
-          sync_auth_tokens
+          # Sync refreshed tokens and persistent state right before dispatching the successor
+          sync_auth_and_state
 
           if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
             echo "Primary dispatch failed. Activating fallback: ${FALLBACK_TARGET}..."
@@ -457,21 +501,26 @@ jobs:
           CLONE_PAT: ${{ secrets.CLONE_PAT }}
         run: |
           echo "=== PHASE 5: Teardown & Deregistration ==="
-          # Final sync of auth folders if modified before container termination
+          # Final sync of auth folders and persistent state if modified before container termination
           if [ -d "the-vps" ] && [ -n "$CLONE_PAT" ]; then
-            echo "Final sync: preserving latest session tokens..."
+            echo "Final sync: preserving latest session tokens and Tailscale state..."
             (
               cd the-vps
               git config user.name "Silver-kun"
               git config user.email "silver-kun@users.noreply.github.com"
-              git add AIStudioToAPI/auth* 2>/dev/null || true
+              mkdir -p configs/tailscale/certs
+              sudo cp -f /var/lib/tailscale/tailscaled.state configs/tailscale/tailscaled.state 2>/dev/null || true
+              sudo cp -f /var/lib/tailscale/tailscaled.state configs/tailscale/tailscaled_trial.state 2>/dev/null || true
+              sudo cp -rf /var/lib/tailscale/certs/* configs/tailscale/certs/ 2>/dev/null || true
+              sudo chown -R runner:docker configs/tailscale/
+              git add AIStudioToAPI/auth* configs/tailscale/ 2>/dev/null || true
               if ! git diff --cached --quiet; then
-                git commit -m "Auto-refresh: final session token sync [skip ci]" || true
+                git commit -m "Auto-refresh: final session token & Tailscale state sync [skip ci]" || true
                 git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
                 git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
               fi
             ) || true
           fi
           (cd the-vps/AIStudioToAPI 2>/dev/null && docker compose down -t 2) || true
-          sudo tailscale down 2>/dev/null || true
+          sudo systemctl stop tailscaled 2>/dev/null || true
           echo "Node shutdown clean. 'silver-trial' released."
