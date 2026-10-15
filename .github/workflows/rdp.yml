@@ -65,7 +65,7 @@ jobs:
           git config --global user.name "Silver-kun"
           git config --global user.email "silver-kun@users.noreply.github.com"
           rm -rf the-vps 2>/dev/null || true
-          git clone --depth=1 "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" the-vps
+          git clone --depth=1 "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" the-vps
 
           # Launch AIStudioToAPI container safely
           (cd the-vps/AIStudioToAPI && (docker compose up -d --build || docker compose up -d))
@@ -469,8 +469,8 @@ jobs:
                   echo "Found updated auth tokens or Tailscale state! Committing and pushing to main..."
                   git commit -m "Auto-refresh: update active session tokens & persistent Tailscale state [skip ci]" || true
                   # Pull newest remote changes to prevent non-fast-forward rejection
-                  git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
-                  git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
+                  git pull --rebase -X theirs "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
+                  git push "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
                 else
                   echo "No changes detected in auth folders or Tailscale state."
                 fi
@@ -516,8 +516,8 @@ jobs:
               git add AIStudioToAPI/auth* configs/tailscale/ 2>/dev/null || true
               if ! git diff --cached --quiet; then
                 git commit -m "Auto-refresh: final session token & Tailscale state sync [skip ci]" || true
-                git pull --rebase -X theirs "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
-                git push "https://${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
+                git pull --rebase -X theirs "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" main 2>/dev/null || true
+                git push "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/THE-VPS-SET-UP.git" HEAD:main 2>/dev/null || true
               fi
             ) || true
           fi
